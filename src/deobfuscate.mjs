@@ -24,7 +24,6 @@
 
 import fs from "fs";
 import path from "path";
-import vm from "vm";
 import { fileURLToPath } from "url";
 import { execSync, spawnSync } from "child_process";
 import { createRequire } from "module";
@@ -36,6 +35,16 @@ const __dirname = path.dirname(__filename);
 // @wakaru/unminify ESM dist has a broken prettier import (no .js extension),
 // so we use CJS require which resolves fine.
 const { runTransformationRules } = require("@wakaru/unminify");
+
+// @wakaru/unminify bundles its own @babel/parser (7.24.x) with a fixed plugin
+// list that predates ES2026 Explicit Resource Management, so any file using
+// `using` / `await using` declarations makes wakaru's parser throw
+// "MissingPlugin: explicitResourceManagement" and silently return the source
+// unchanged. We detect such files up front and run the equivalent safe
+// transforms with our own (newer) babel parser instead.
+const babelParser = require("@babel/parser");
+const babelTraverse = require("@babel/traverse").default;
+const recast = require("recast");
 
 // ── Argument parsing ──────────────────────────────────────────────
 
@@ -170,11 +179,116 @@ const SAFE_WAKARU_RULES = [
 
 function validateJavaScriptSyntax(code, filename) {
   try {
-    new vm.Script(code, { filename });
+    // Use babel (not vm.Script) so modern syntax like `await using` —
+    // which V8 may not yet support — still validates correctly.
+    babelParser.parse(code, {
+      sourceType: "unambiguous",
+      allowImportExportEverywhere: true,
+      allowReturnOutsideFunction: true,
+      plugins: WAKARU_COMPAT_PLUGINS,
+      filename,
+    });
     return null;
   } catch (err) {
     return err;
   }
+}
+
+// Parser plugin set mirroring @wakaru/unminify's bundled babel parser
+// (packages/shared/src/babylon.ts), plus "explicitResourceManagement" so
+// modern `using` / `await using` declarations parse in our fallback.
+const WAKARU_COMPAT_PLUGINS = [
+  "jsx",
+  ["decorators", { decoratorsBeforeExport: false }],
+  "doExpressions",
+  "exportDefaultFrom",
+  "functionBind",
+  "functionSent",
+  "importMeta",
+  ["pipelineOperator", { proposal: "minimal" }],
+  "throwExpressions",
+  "explicitResourceManagement",
+];
+
+const WAKARU_BABEL_OPTIONS = {
+  sourceType: "module",
+  allowImportExportEverywhere: true,
+  allowReturnOutsideFunction: true,
+  startLine: 1,
+  tokens: true,
+};
+
+// Returns true when the source contains `using` / `await using` declarations,
+// which wakaru's pinned babel 7.24 parser cannot handle.
+function usesExplicitResourceManagement(source) {
+  // Cheap pre-filter before the full AST scan.
+  if (!/\b(using|await\s+using)\b/.test(source)) return false;
+  try {
+    const ast = babelParser.parse(source, {
+      ...WAKARU_BABEL_OPTIONS,
+      plugins: WAKARU_COMPAT_PLUGINS,
+    });
+    let found = false;
+    babelTraverse(ast, {
+      VariableDeclaration(p) {
+        if (p.node.kind === "using" || p.node.kind === "await using") {
+          found = true;
+          p.stop();
+        }
+      },
+    });
+    return found;
+  } catch {
+    return false; // unparseable for other reasons; let wakaru report it
+  }
+}
+
+// Babel parser config for the fallback transform path.
+function parseWakaruCompat(code) {
+  return babelParser.parse(code, {
+    ...WAKARU_BABEL_OPTIONS,
+    plugins: WAKARU_COMPAT_PLUGINS,
+  });
+}
+
+// Fallback transform for files @wakaru/unminify cannot parse (e.g. code using
+// `await using`). Implements the same safe rewrites as our SAFE_WAKARU_RULES:
+//   un-boolean:          !0 / !1 → true / false (recast prints the original)
+//   un-numeric-literal:  (wakaru canonicalizes separators/legacy octal — rarely
+//                        needed here; recast already preserves numeric text)
+//   un-bracket-notation: obj["key"] → obj.key
+// un-typeof is skipped: wakaru compares raw `typeof x` operand text and never
+// rewrites valid code.
+function applyWakaruCompatTransforms(source) {
+  const ast = recast.parse(source, { parser: { parse: parseWakaruCompat } });
+  const isValidIdent = /^[$A-Z_a-z][$\w]*$/;
+  babelTraverse(ast, {
+    UnaryExpression(p) {
+      const { node } = p;
+      if (
+        node.operator === "!" &&
+        node.argument.type === "NumericLiteral" &&
+        (node.argument.value === 0 || node.argument.value === 1)
+      ) {
+        p.replaceWith({
+          type: "BooleanLiteral",
+          value: node.argument.value === 0, // !0 === true, !1 === false
+        });
+      }
+    },
+    MemberExpression(p) {
+      const { node } = p;
+      if (
+        node.computed &&
+        node.property.type === "StringLiteral" &&
+        isValidIdent.test(node.property.value)
+      ) {
+        node.property = { type: "Identifier", name: node.property.value };
+        node.computed = false;
+      }
+    },
+  });
+  return recast.print(ast).code;
 }
 
 function resolveWakaruRules(wakaruRulesOpt) {
@@ -225,11 +339,16 @@ async function stageWakaru(dir, files, concurrency, strictWakaru = false, wakaru
     };
 
     try {
-      const result = await runTransformationRules(
-        { path: f, source },
-        activeRules,
-      );
-      const transformedCode = result.code ?? source;
+      // If the file uses `using` / `await using` declarations, wakaru's
+      // pinned babel 7.24 parser cannot handle it (missing
+      // "explicitResourceManagement" plugin) and would silently skip the
+      // file — run our equivalent local transforms instead.
+      const canParse = !usesExplicitResourceManagement(source);
+
+      const transformedCode = canParse
+        ? (await runTransformationRules({ path: f, source }, activeRules))
+            .code ?? source
+        : applyWakaruCompatTransforms(source);
 
       if (strictWakaru && transformedCode !== source) {
         const syntaxErr = validateJavaScriptSyntax(transformedCode, f);
@@ -241,11 +360,12 @@ async function stageWakaru(dir, files, concurrency, strictWakaru = false, wakaru
         }
 
         // Determinism gate: applying the same rules again should be a no-op.
-        const secondPass = await runTransformationRules(
-          { path: f, source: transformedCode },
-          activeRules,
-        );
-        const secondCode = secondPass.code ?? transformedCode;
+        const secondCode = canParse
+          ? (await runTransformationRules(
+              { path: f, source: transformedCode },
+              activeRules,
+            )).code ?? transformedCode
+          : applyWakaruCompatTransforms(transformedCode);
         if (secondCode !== transformedCode) {
           console.warn(`  Warning: strict-wakaru rejected ${f} (non-idempotent output)`);
           errors++;

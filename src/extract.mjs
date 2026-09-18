@@ -61,7 +61,8 @@ console.log(`Trailer at offset: ${trailerOffset}`);
 // --- Step 3: Read Offsets struct (32 bytes before trailer) ---
 // Offsets = { byte_count: u64, modules_ptr: {u32,u32}, entry_point_id: u32,
 //             exec_argv_ptr: {u32,u32}, flags: u32 }
-const os = trailerOffset - 32;
+const OFFSETS_SIZE = 32;
+const os = trailerOffset - OFFSETS_SIZE;
 const byteCount = Number(buf.readBigUInt64LE(os));
 const modOffset = buf.readUInt32LE(os + 8);
 const modLength = buf.readUInt32LE(os + 12);
@@ -71,14 +72,22 @@ const flags = buf.readUInt32LE(os + 28);
 console.log(`\nOffsets: byteCount=${byteCount}, modules={off:${modOffset},len:${modLength}}, entry=${entryPointId}, flags=0x${flags.toString(16)}`);
 
 // --- Step 4: Calculate data_start ---
-// On Mach-O, the __BUN section has an 8-byte size header, then the data
-// StringPointer offsets are relative to the start of data (after the header)
+// StringPointer offsets inside each module entry are relative to the start
+// of raw_bytes (what Bun passes to StandaloneModuleGraph.fromBytes).
+// raw_bytes = [data section .. module table .. Offsets struct .. trailer],
+// so its total size is byteCount + sizeof(Offsets) + trailer.length.
+// Per bun/src/StandaloneModuleGraph.zig: byte_count is "the length of the
+// module graph with padding, excluding the trailer and offsets".
+//
+//   Mach-O: section_offset points at [u64 payload_len][raw_bytes], so
+//           raw_bytes starts at section_offset + 8.
+//   Linux/ELF: raw_bytes is appended and ends at trailerOffset + trailer.length,
+//              so it starts at trailerEnd - (byteCount + Offsets + trailer).
 let dataStart;
 if (sectionOffset >= 0) {
   dataStart = sectionOffset + SECTION_HEADER_SIZE;
 } else {
-  // Fallback: compute from trailer
-  dataStart = trailerOffset + trailerBuf.length - byteCount;
+  dataStart = trailerOffset - byteCount - OFFSETS_SIZE;
 }
 console.log(`Data starts at: ${dataStart}`);
 
